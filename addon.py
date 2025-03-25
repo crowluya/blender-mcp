@@ -9,12 +9,14 @@ import tempfile
 import traceback
 import os
 import shutil
+import subprocess
+import sys
 from bpy.props import StringProperty, IntProperty, BoolProperty, EnumProperty
 
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (0, 2),
+    "version": (0, 3),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
@@ -796,8 +798,7 @@ class BlenderMCPServer:
                     links = mat.node_tree.links
                     
                     # Clear default nodes
-                    for node in nodes:
-                        nodes.remove(node)
+                    nodes.clear()
                     
                     # Create output node
                     output = nodes.new(type='ShaderNodeOutputMaterial')
@@ -1394,8 +1395,8 @@ class BlenderMCPServer:
                 "Authorization": f"Bearer {bpy.context.scene.blendermcp_hyper3d_api_key}",
             },
             json={
-                "subscription_key": subscription_key,
-            },
+                'task_uuid': subscription_key
+            }
         )
         data = response.json()
         return {
@@ -1607,20 +1608,50 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
         layout = self.layout
         scene = context.scene
         
-        layout.prop(scene, "blendermcp_port")
+        # Connection Mode
+        layout.prop(scene, "blendermcp_connection_mode", text="Connection Mode")
+        
+        # Direct connection settings
+        if scene.blendermcp_connection_mode == 'DIRECT':
+            box = layout.box()
+            box.label(text="Direct Connection Settings")
+            box.prop(scene, "blendermcp_port")
+            
+        # Proxy connection settings
+        elif scene.blendermcp_connection_mode == 'PROXY':
+            box = layout.box()
+            box.label(text="Proxy Settings")
+            box.prop(scene, "blendermcp_port", text="Local Port")
+            box.prop(scene, "blendermcp_proxy_port", text="Proxy Port")
+            box.prop(scene, "blendermcp_proxy_host", text="Proxy Host")
+            box.prop(scene, "blendermcp_proxy_api_key", text="API Key")
+        
+        # Feature toggles
+        layout.separator()
+        layout.label(text="Features:")
         layout.prop(scene, "blendermcp_use_polyhaven", text="Use assets from Poly Haven")
-
         layout.prop(scene, "blendermcp_use_hyper3d", text="Use Hyper3D Rodin 3D model generation")
+        
         if scene.blendermcp_use_hyper3d:
             layout.prop(scene, "blendermcp_hyper3d_mode", text="Rodin Mode")
             layout.prop(scene, "blendermcp_hyper3d_api_key", text="API Key")
             layout.operator("blendermcp.set_hyper3d_free_trial_api_key", text="Set Free Trial API Key")
         
+        # Connection controls
+        layout.separator()
         if not scene.blendermcp_server_running:
-            layout.operator("blendermcp.start_server", text="Start MCP Server")
+            if scene.blendermcp_connection_mode == 'DIRECT':
+                layout.operator("blendermcp.start_server", text="Start MCP Server")
+            else:
+                layout.operator("blendermcp.start_proxy", text="Start Proxy Server")
         else:
-            layout.operator("blendermcp.stop_server", text="Stop MCP Server")
-            layout.label(text=f"Running on port {scene.blendermcp_port}")
+            if scene.blendermcp_connection_mode == 'DIRECT':
+                layout.operator("blendermcp.stop_server", text="Stop MCP Server")
+                layout.label(text=f"Running on port {scene.blendermcp_port}")
+            else:
+                layout.operator("blendermcp.stop_proxy", text="Stop Proxy Server")
+                layout.label(text=f"Proxy running on port {scene.blendermcp_proxy_port}")
+                layout.label(text=f"Connected to Blender on port {scene.blendermcp_port}")
 
 # Operator to set Hyper3D API Key
 class BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey(bpy.types.Operator):
@@ -1649,6 +1680,7 @@ class BLENDERMCP_OT_StartServer(bpy.types.Operator):
         # Start the server
         bpy.types.blendermcp_server.start()
         scene.blendermcp_server_running = True
+        scene.blendermcp_proxy_running = False
         
         return {'FINISHED'}
 
@@ -1670,9 +1702,131 @@ class BLENDERMCP_OT_StopServer(bpy.types.Operator):
         
         return {'FINISHED'}
 
+# Operator to start the proxy server
+class BLENDERMCP_OT_StartProxy(bpy.types.Operator):
+    bl_idname = "blendermcp.start_proxy"
+    bl_label = "Start Proxy Server"
+    bl_description = "Start the BlenderMCP proxy server for secure remote connections"
+    
+    def execute(self, context):
+        scene = context.scene
+        
+        # Start direct server first if not running
+        if not hasattr(bpy.types, "blendermcp_server") or not bpy.types.blendermcp_server:
+            bpy.types.blendermcp_server = BlenderMCPServer(port=scene.blendermcp_port)
+            bpy.types.blendermcp_server.start()
+        
+        # Find the Python executable that's running this addon
+        python_executable = sys.executable
+        
+        # Try to find the blender-mcp module location - this assumes the module is installed
+        try:
+            # First try to import the module to see if it's installed
+            import importlib.util
+            import importlib.machinery
+            
+            # Try different module paths that might contain the proxy client
+            module_paths = [
+                os.path.join(os.path.dirname(__file__), "src", "blender_mcp", "proxy_client.py"),
+                os.path.join(os.path.dirname(__file__), "blender_mcp", "proxy_client.py"),
+                os.path.join(bpy.utils.user_resource('SCRIPTS'), "addons", "blender-mcp", "src", "blender_mcp", "proxy_client.py"),
+                os.path.join(bpy.utils.user_resource('SCRIPTS'), "addons", "blender-mcp", "blender_mcp", "proxy_client.py")
+            ]
+            
+            proxy_module_path = None
+            for path in module_paths:
+                if os.path.exists(path):
+                    proxy_module_path = path
+                    break
+            
+            if not proxy_module_path:
+                self.report({'ERROR'}, "Could not find proxy client module. Please make sure the blender-mcp module is installed correctly.")
+                return {'CANCELLED'}
+                
+            # Start the proxy client as a subprocess
+            cmd = [
+                python_executable,
+                proxy_module_path,
+                "--host", "localhost",
+                "--port", str(scene.blendermcp_port),
+                "--proxy-host", scene.blendermcp_proxy_host,
+                "--proxy-port", str(scene.blendermcp_proxy_port)
+            ]
+            
+            # Add API key if provided
+            if scene.blendermcp_proxy_api_key:
+                cmd.extend(["--api-key", scene.blendermcp_proxy_api_key])
+            
+            # Store the process in a property so we can kill it later
+            try:
+                bpy.types.blendermcp_proxy_process = subprocess.Popen(
+                    cmd, 
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                scene.blendermcp_proxy_running = True
+                scene.blendermcp_server_running = True
+                self.report({'INFO'}, f"Proxy server started on port {scene.blendermcp_proxy_port}")
+            except Exception as e:
+                self.report({'ERROR'}, f"Failed to start proxy server: {str(e)}")
+                return {'CANCELLED'}
+                
+        except Exception as e:
+            self.report({'ERROR'}, f"Error starting proxy server: {str(e)}")
+            return {'CANCELLED'}
+        
+        return {'FINISHED'}
+
+# Operator to stop the proxy server
+class BLENDERMCP_OT_StopProxy(bpy.types.Operator):
+    bl_idname = "blendermcp.stop_proxy"
+    bl_label = "Stop Proxy Server"
+    bl_description = "Stop the BlenderMCP proxy server"
+    
+    def execute(self, context):
+        scene = context.scene
+        
+        # Kill the proxy process if it exists
+        if hasattr(bpy.types, "blendermcp_proxy_process") and bpy.types.blendermcp_proxy_process:
+            try:
+                # Try to terminate gracefully first
+                bpy.types.blendermcp_proxy_process.terminate()
+                # Wait a bit for process to terminate
+                try:
+                    bpy.types.blendermcp_proxy_process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    # If it doesn't terminate, force kill
+                    bpy.types.blendermcp_proxy_process.kill()
+                
+                del bpy.types.blendermcp_proxy_process
+                scene.blendermcp_proxy_running = False
+                self.report({'INFO'}, "Proxy server stopped")
+            except Exception as e:
+                self.report({'ERROR'}, f"Error stopping proxy server: {str(e)}")
+        
+        # Stop the direct server as well
+        if hasattr(bpy.types, "blendermcp_server") and bpy.types.blendermcp_server:
+            bpy.types.blendermcp_server.stop()
+            del bpy.types.blendermcp_server
+            
+        scene.blendermcp_server_running = False
+        
+        return {'FINISHED'}
+
 # Registration functions
 def register():
-    bpy.types.Scene.blendermcp_port = IntProperty(
+    bpy.types.Scene.blendermcp_connection_mode = bpy.props.EnumProperty(
+        name="Connection Mode",
+        description="Choose connection method: direct (local) or proxy (remote)",
+        items=[
+            ("DIRECT", "Direct", "Connect directly to MCP server (local only)"),
+            ("PROXY", "Proxy", "Connect via proxy (secure remote access)")
+        ],
+        default="DIRECT"
+    )
+    
+    bpy.types.Scene.blendermcp_port = bpy.props.IntProperty(
         name="Port",
         description="Port for the BlenderMCP server",
         default=9876,
@@ -1680,8 +1834,34 @@ def register():
         max=65535
     )
     
+    bpy.types.Scene.blendermcp_proxy_host = bpy.props.StringProperty(
+        name="Proxy Host",
+        description="Host to bind the proxy server to (use 0.0.0.0 for remote access)",
+        default="127.0.0.1"
+    )
+    
+    bpy.types.Scene.blendermcp_proxy_port = bpy.props.IntProperty(
+        name="Proxy Port",
+        description="Port for the BlenderMCP proxy server",
+        default=5000,
+        min=1024,
+        max=65535
+    )
+    
+    bpy.types.Scene.blendermcp_proxy_api_key = bpy.props.StringProperty(
+        name="Proxy API Key",
+        description="API key for proxy authentication (optional)",
+        subtype="PASSWORD",
+        default=""
+    )
+    
     bpy.types.Scene.blendermcp_server_running = bpy.props.BoolProperty(
         name="Server Running",
+        default=False
+    )
+    
+    bpy.types.Scene.blendermcp_proxy_running = bpy.props.BoolProperty(
+        name="Proxy Running",
         default=False
     )
     
@@ -1718,22 +1898,42 @@ def register():
     bpy.utils.register_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
     bpy.utils.register_class(BLENDERMCP_OT_StartServer)
     bpy.utils.register_class(BLENDERMCP_OT_StopServer)
+    bpy.utils.register_class(BLENDERMCP_OT_StartProxy)
+    bpy.utils.register_class(BLENDERMCP_OT_StopProxy)
     
     print("BlenderMCP addon registered")
 
 def unregister():
-    # Stop the server if it's running
+    # Stop any running servers
     if hasattr(bpy.types, "blendermcp_server") and bpy.types.blendermcp_server:
         bpy.types.blendermcp_server.stop()
         del bpy.types.blendermcp_server
+    
+    # Stop any running proxy processes
+    if hasattr(bpy.types, "blendermcp_proxy_process") and bpy.types.blendermcp_proxy_process:
+        try:
+            bpy.types.blendermcp_proxy_process.terminate()
+            try:
+                bpy.types.blendermcp_proxy_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                bpy.types.blendermcp_proxy_process.kill()
+        except:
+            pass
     
     bpy.utils.unregister_class(BLENDERMCP_PT_Panel)
     bpy.utils.unregister_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
     bpy.utils.unregister_class(BLENDERMCP_OT_StartServer)
     bpy.utils.unregister_class(BLENDERMCP_OT_StopServer)
+    bpy.utils.unregister_class(BLENDERMCP_OT_StartProxy)
+    bpy.utils.unregister_class(BLENDERMCP_OT_StopProxy)
     
+    del bpy.types.Scene.blendermcp_connection_mode
     del bpy.types.Scene.blendermcp_port
+    del bpy.types.Scene.blendermcp_proxy_host
+    del bpy.types.Scene.blendermcp_proxy_port
+    del bpy.types.Scene.blendermcp_proxy_api_key
     del bpy.types.Scene.blendermcp_server_running
+    del bpy.types.Scene.blendermcp_proxy_running
     del bpy.types.Scene.blendermcp_use_polyhaven
     del bpy.types.Scene.blendermcp_use_hyper3d
     del bpy.types.Scene.blendermcp_hyper3d_mode

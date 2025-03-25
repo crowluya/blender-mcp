@@ -11,11 +11,23 @@ import os
 from pathlib import Path
 import base64
 from urllib.parse import urlparse
+from .connectors import create_connector, BlenderConnector, DirectConnector, ProxyConnector
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("BlenderMCPServer")
+
+# Environment variable configuration
+BLENDER_HOST = os.environ.get("BLENDER_HOST", "localhost")
+BLENDER_PORT = int(os.environ.get("BLENDER_PORT", "9876"))
+# Proxy mode configuration
+MCP_MODE = os.environ.get("MCP_MODE", "direct").lower()
+MCP_PROXY_URL = os.environ.get("MCP_PROXY_URL", "")
+MCP_CLIENT_ID = os.environ.get("MCP_CLIENT_ID", str(uuid.uuid4()))
+MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
+
+logger.info(f"Blender connection configured for {BLENDER_HOST}:{BLENDER_PORT}")
 
 @dataclass
 class BlenderConnection:
@@ -182,11 +194,11 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         yield {}
     finally:
         # Clean up the global connection on shutdown
-        global _blender_connection
-        if _blender_connection:
+        global _blender_connector
+        if _blender_connector:
             logger.info("Disconnecting from Blender on shutdown")
-            _blender_connection.disconnect()
-            _blender_connection = None
+            _blender_connector.disconnect()
+            _blender_connector = None
         logger.info("BlenderMCP server shut down")
 
 # Create the MCP server with lifespan support
@@ -199,41 +211,80 @@ mcp = FastMCP(
 # Resource endpoints
 
 # Global connection for resources (since resources can't access context)
-_blender_connection = None
+_blender_connector = None
 _polyhaven_enabled = False  # Add this global variable
 
 def get_blender_connection():
     """Get or create a persistent Blender connection"""
-    global _blender_connection, _polyhaven_enabled  # Add _polyhaven_enabled to globals
+    global _blender_connector, _polyhaven_enabled
     
     # If we have an existing connection, check if it's still valid
-    if _blender_connection is not None:
+    if _blender_connector is not None:
         try:
-            # First check if PolyHaven is enabled by sending a ping command
-            result = _blender_connection.send_command("get_polyhaven_status")
-            # Store the PolyHaven status globally
-            _polyhaven_enabled = result.get("enabled", False)
-            return _blender_connection
+            # Check if connection is still valid and Polyhaven is enabled
+            if _blender_connector.is_connected():
+                # First check if PolyHaven is enabled by sending a ping command
+                result = _blender_connector.send_command("get_polyhaven_status")
+                # Store the PolyHaven status globally
+                _polyhaven_enabled = result.get("enabled", False)
+                return _blender_connector
         except Exception as e:
             # Connection is dead, close it and create a new one
             logger.warning(f"Existing connection is no longer valid: {str(e)}")
             try:
-                _blender_connection.disconnect()
+                _blender_connector.disconnect()
             except:
                 pass
-            _blender_connection = None
+            _blender_connector = None
     
     # Create a new connection if needed
-    if _blender_connection is None:
-        _blender_connection = BlenderConnection(host="localhost", port=9876)
-        if not _blender_connection.connect():
-            logger.error("Failed to connect to Blender")
-            _blender_connection = None
-            raise Exception("Could not connect to Blender. Make sure the Blender addon is running.")
-        logger.info("Created new persistent connection to Blender")
+    if _blender_connector is None:
+        try:
+            # Log connection mode
+            logger.info(f"Creating new Blender connection using mode: {MCP_MODE}")
+            
+            if MCP_MODE == "direct":
+                logger.info(f"Connecting directly to Blender at {BLENDER_HOST}:{BLENDER_PORT}")
+                _blender_connector = create_connector(
+                    mode="direct", 
+                    host=BLENDER_HOST, 
+                    port=BLENDER_PORT
+                )
+            elif MCP_MODE == "proxy":
+                if not MCP_PROXY_URL:
+                    raise ValueError("MCP_PROXY_URL environment variable must be set when using proxy mode")
+                
+                logger.info(f"Connecting to Blender via proxy at {MCP_PROXY_URL}")
+                _blender_connector = create_connector(
+                    mode="proxy",
+                    proxy_url=MCP_PROXY_URL,
+                    client_id=MCP_CLIENT_ID,
+                    auth_token=MCP_AUTH_TOKEN
+                )
+            else:
+                raise ValueError(f"Unsupported MCP_MODE: {MCP_MODE}")
+                
+            if not _blender_connector.connect():
+                logger.error(f"Failed to connect to Blender using {MCP_MODE} mode")
+                _blender_connector = None
+                raise Exception(f"Could not connect to Blender. Make sure the Blender addon is running.")
+                
+            logger.info(f"Created new persistent connection to Blender using {MCP_MODE} mode")
+            
+            # Check PolyHaven status after connecting
+            try:
+                result = _blender_connector.send_command("get_polyhaven_status")
+                _polyhaven_enabled = result.get("enabled", False)
+            except Exception as e:
+                logger.warning(f"Could not check PolyHaven status: {str(e)}")
+                _polyhaven_enabled = False
+                
+        except Exception as e:
+            logger.error(f"Failed to create Blender connection: {str(e)}")
+            _blender_connector = None
+            raise Exception(f"Could not connect to Blender. Make sure the Blender addon is running.")
     
-    return _blender_connection
-
+    return _blender_connector
 
 @mcp.tool()
 def get_scene_info(ctx: Context) -> str:
@@ -266,8 +317,6 @@ def get_object_info(ctx: Context, object_name: str) -> str:
         logger.error(f"Error getting object info from Blender: {str(e)}")
         return f"Error getting object info: {str(e)}"
 
-
-
 @mcp.tool()
 def create_object(
     ctx: Context,
@@ -295,9 +344,8 @@ def create_object(
     - name: Optional name for the object
     - location: Optional [x, y, z] location coordinates
     - rotation: Optional [x, y, z] rotation in radians
-    - scale: Optional [x, y, z] scale factors (not used for TORUS)
-    
-    Torus-specific parameters (only used when type == "TORUS"):
+    - scale: Optional [x, y, z] scale factors
+    - Torus-specific parameters (only used when type == "TORUS"):
     - align: How to align the torus ('WORLD', 'VIEW', or 'CURSOR')
     - major_segments: Number of segments for the main ring
     - minor_segments: Number of segments for the cross-section
@@ -352,7 +400,6 @@ def create_object(
     except Exception as e:
         logger.error(f"Error creating object: {str(e)}")
         return f"Error creating object: {str(e)}"
-
 
 @mcp.tool()
 def modify_object(
@@ -726,7 +773,6 @@ def generate_hyper3d_model_via_text(
     except Exception as e:
         logger.error(f"Error generating Hyper3D task: {str(e)}")
         return f"Error generating Hyper3D task: {str(e)}"
-    return f"Placeholder, under development, not implemented yet."
 
 @mcp.tool()
 def generate_hyper3d_model_via_images(
