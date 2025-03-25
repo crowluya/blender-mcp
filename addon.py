@@ -9,12 +9,14 @@ import tempfile
 import traceback
 import os
 import shutil
+import ssl
+import uuid
 from bpy.props import StringProperty, IntProperty, BoolProperty, EnumProperty
 
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (0, 2),
+    "version": (0, 3),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
@@ -24,12 +26,18 @@ bl_info = {
 RODIN_FREE_TRIAL_KEY = "k9TcfFoEhNd9cCPP2guHAHHHkctZHIRhZDywZ1euGUXwihbYLpOjQhofby80NJez"
 
 class BlenderMCPServer:
-    def __init__(self, host='localhost', port=9876):
-        self.host = host
-        self.port = port
+    def __init__(self, host='localhost', port=9876, is_remote=False, 
+                 remote_host=None, remote_port=None, api_key=None):
+        self.host = host if not is_remote else remote_host
+        self.port = port if not is_remote else remote_port
+        self.is_remote = is_remote
+        self.api_key = api_key
+        self.instance_id = None
+        self.instance_name = None
         self.running = False
         self.socket = None
         self.server_thread = None
+        self.client_socket = None
     
     def start(self):
         if self.running:
@@ -38,22 +46,32 @@ class BlenderMCPServer:
             
         self.running = True
         
-        try:
-            # Create socket
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.socket.bind((self.host, self.port))
-            self.socket.listen(1)
-            
-            # Start server thread
-            self.server_thread = threading.Thread(target=self._server_loop)
-            self.server_thread.daemon = True
-            self.server_thread.start()
-            
-            print(f"BlenderMCP server started on {self.host}:{self.port}")
-        except Exception as e:
-            print(f"Failed to start server: {str(e)}")
-            self.stop()
+        if not self.is_remote:
+            # 本地服务器模式 - 创建服务器
+            try:
+                # Create socket
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self.socket.bind((self.host, self.port))
+                self.socket.listen(1)
+                
+                # Start server thread
+                self.server_thread = threading.Thread(target=self._server_loop)
+                self.server_thread.daemon = True
+                self.server_thread.start()
+                
+                print(f"BlenderMCP server started on {self.host}:{self.port}")
+            except Exception as e:
+                print(f"Failed to start server: {str(e)}")
+                self.stop()
+        else:
+            # 远程模式 - 注册并连接到远程服务器
+            print(f"BlenderMCP client mode - will connect to {self.host}:{self.port}")
+            if self.register_with_remote_server():
+                print(f"Registered with remote server as instance {self.instance_id}")
+            else:
+                print("Failed to register with remote server")
+                self.stop()
             
     def stop(self):
         self.running = False
@@ -66,6 +84,14 @@ class BlenderMCPServer:
                 pass
             self.socket = None
         
+        # Close client socket if in remote mode
+        if self.client_socket:
+            try:
+                self.client_socket.close()
+            except:
+                pass
+            self.client_socket = None
+        
         # Wait for thread to finish
         if self.server_thread:
             try:
@@ -77,92 +103,276 @@ class BlenderMCPServer:
         
         print("BlenderMCP server stopped")
     
-    def _server_loop(self):
-        """Main server loop in a separate thread"""
-        print("Server thread started")
-        self.socket.settimeout(1.0)  # Timeout to allow for stopping
+    def register_with_remote_server(self):
+        """向远程服务器注册实例并获取实例 ID"""
+        if not self.is_remote or not self.api_key:
+            return False
         
-        while self.running:
+        try:
+            # 创建连接到远程服务器的 socket
+            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            
+            # 尝试使用 SSL/TLS
             try:
-                # Accept new connection
+                context = ssl.create_default_context()
+                # 在生产环境中，应该禁用证书验证
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                self.client_socket = context.wrap_socket(self.client_socket, server_hostname=self.host)
+                print(f"Using SSL for connection to {self.host}:{self.port}")
+            except Exception as e:
+                print(f"Failed to setup SSL: {str(e)}")
+                # 如果 SSL 失败，回退到非加密连接
+                self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            
+            # 连接到服务器
+            self.client_socket.connect((self.host, self.port))
+            
+            # 生成实例名称
+            hostname = socket.gethostname()
+            self.instance_name = f"Blender-{hostname}"
+            
+            # 发送注册请求
+            register_command = {
+                "type": "register_blender_instance",
+                "params": {
+                    "api_key": self.api_key,
+                    "instance_name": self.instance_name
+                }
+            }
+            
+            self.client_socket.sendall(json.dumps(register_command).encode('utf-8'))
+            
+            # 接收响应
+            response_data = self._receive_data(self.client_socket)
+            response = json.loads(response_data.decode('utf-8'))
+            
+            if response.get("status") == "error":
+                print(f"Registration failed: {response.get('message')}")
+                return False
+            
+            # 解析响应内容
+            result = json.loads(response.get("result", "{}"))
+            
+            # 存储实例 ID
+            self.instance_id = result.get("instance_id")
+            
+            return True
+        except Exception as e:
+            print(f"Failed to register with remote server: {str(e)}")
+            if self.client_socket:
                 try:
-                    client, address = self.socket.accept()
-                    print(f"Connected to client: {address}")
+                    self.client_socket.close()
+                except:
+                    pass
+                self.client_socket = None
+            return False
+    
+    def _receive_data(self, sock, buffer_size=8192):
+        """接收完整的数据"""
+        chunks = []
+        sock.settimeout(15.0)
+        
+        try:
+            while True:
+                chunk = sock.recv(buffer_size)
+                if not chunk:
+                    break
+                
+                chunks.append(chunk)
+                
+                try:
+                    # 检查是否收到完整的 JSON 对象
+                    data = b''.join(chunks)
+                    json.loads(data.decode('utf-8'))
+                    # 如果解析成功，说明收到完整数据
+                    return data
+                except json.JSONDecodeError:
+                    # 不完整的 JSON，继续接收
+                    continue
+        except socket.timeout:
+            print("Socket timeout during receive")
+        except Exception as e:
+            print(f"Error during receive: {str(e)}")
+            raise
+            
+        # 如果到这里，说明超时或循环正常结束
+        if chunks:
+            data = b''.join(chunks)
+            try:
+                # 尝试解析我们已有的数据
+                json.loads(data.decode('utf-8'))
+                return data
+            except json.JSONDecodeError:
+                # 如果无法解析，说明数据不完整
+                raise Exception("Incomplete JSON response received")
+        else:
+            raise Exception("No data received")
+    
+    def _server_loop(self):
+        """主服务器循环"""
+        print("Server thread started")
+        
+        if not self.is_remote:
+            # 本地服务器模式
+            self.socket.settimeout(1.0)  # Timeout to allow for stopping
+            
+            while self.running:
+                try:
+                    client, addr = self.socket.accept()
+                    print(f"Client connected from {addr}")
                     
                     # Handle client in a separate thread
-                    client_thread = threading.Thread(
-                        target=self._handle_client,
-                        args=(client,)
-                    )
+                    client_thread = threading.Thread(target=self._handle_client, args=(client,))
                     client_thread.daemon = True
                     client_thread.start()
                 except socket.timeout:
-                    # Just check running condition
+                    # 这是预期的，继续循环
                     continue
                 except Exception as e:
-                    print(f"Error accepting connection: {str(e)}")
-                    time.sleep(0.5)
-            except Exception as e:
-                print(f"Error in server loop: {str(e)}")
-                if not self.running:
+                    if self.running:  # 只在非故意停止时记录
+                        print(f"Error in server loop: {str(e)}")
                     break
-                time.sleep(0.5)
+        else:
+            # 远程连接模式 - 保持与服务器的连接并监听命令
+            if not self.client_socket:
+                print("No connection to remote server")
+                return
+                
+            try:
+                self.client_socket.settimeout(1.0)  # Timeout to allow for stopping
+                
+                # 发送身份验证信息
+                auth_command = {
+                    "type": "auth",
+                    "params": {
+                        "api_key": self.api_key,
+                        "instance_id": self.instance_id
+                    }
+                }
+                self.client_socket.sendall(json.dumps(auth_command).encode('utf-8'))
+                
+                # 等待确认
+                try:
+                    response_data = self._receive_data(self.client_socket)
+                    response = json.loads(response_data.decode('utf-8'))
+                    
+                    if response.get("status") == "error":
+                        print(f"Authentication failed: {response.get('message')}")
+                        return
+                    
+                    print("Authentication successful")
+                except Exception as e:
+                    print(f"Error during authentication: {str(e)}")
+                    return
+                
+                # 主循环接收命令
+                while self.running:
+                    try:
+                        command_data = self._receive_data(self.client_socket)
+                        command = json.loads(command_data.decode('utf-8'))
+                        
+                        # 执行命令并发送响应
+                        result = self.execute_command(command)
+                        self.client_socket.sendall(json.dumps(result).encode('utf-8'))
+                    except socket.timeout:
+                        # 这是预期的，继续循环
+                        continue
+                    except json.JSONDecodeError as e:
+                        print(f"Invalid JSON received: {str(e)}")
+                        continue
+                    except Exception as e:
+                        if self.running:  # 只在非故意停止时记录
+                            print(f"Error in remote client loop: {str(e)}")
+                        break
+            except Exception as e:
+                print(f"Error in remote connection: {str(e)}")
+            finally:
+                if self.client_socket:
+                    try:
+                        self.client_socket.close()
+                    except:
+                        pass
+                    self.client_socket = None
         
         print("Server thread stopped")
     
     def _handle_client(self, client):
-        """Handle connected client"""
+        """处理连接的客户端"""
         print("Client handler started")
         client.settimeout(None)  # No timeout
         buffer = b''
         
         try:
+            # First, receive authentication data if this is a remote connection
+            if self.is_remote:
+                # Remote connections should have already authenticated
+                pass
+            
+            # Main loop to handle commands
             while self.running:
-                # Receive data
                 try:
+                    # Receive data
                     data = client.recv(8192)
                     if not data:
                         print("Client disconnected")
                         break
                     
+                    # Add to buffer
                     buffer += data
-                    try:
-                        # Try to parse command
-                        command = json.loads(buffer.decode('utf-8'))
-                        buffer = b''
-                        
-                        # Execute command in Blender's main thread
-                        def execute_wrapper():
+                    
+                    # Process complete JSON objects
+                    while buffer:
+                        try:
+                            # Try to parse JSON
+                            command = json.loads(buffer.decode('utf-8'))
+                            
+                            # Handle authentication for the first command if needed
+                            if not hasattr(client, 'authenticated') and command.get('type') == 'auth':
+                                auth_params = command.get('params', {})
+                                api_key = auth_params.get('api_key')
+                                instance_id = auth_params.get('instance_id')
+                                
+                                # Here you would validate the API key and instance ID
+                                # For now, we'll just accept it
+                                client.authenticated = True
+                                client.user_id = "local_user"  # In a real scenario, you'd get this from API key validation
+                                client.instance_id = instance_id or str(uuid.uuid4())
+                                
+                                # Send acknowledgement
+                                response = {"status": "success", "message": "Authenticated successfully"}
+                                client.sendall(json.dumps(response).encode('utf-8'))
+                                
+                                # Clear buffer and continue
+                                buffer = b''
+                                continue
+                            
+                            # For regular commands, execute and send response
+                            result = self.execute_command(command)
+                            client.sendall(json.dumps(result).encode('utf-8'))
+                            
+                            # Clear buffer after processing
+                            buffer = b''
+                            break
+                        except json.JSONDecodeError:
+                            # Incomplete JSON, wait for more data
+                            break
+                        except Exception as e:
+                            print(f"Error processing command: {str(e)}")
+                            
+                            # Send error response
+                            response = {"status": "error", "message": str(e)}
                             try:
-                                response = self.execute_command(command)
-                                response_json = json.dumps(response)
-                                try:
-                                    client.sendall(response_json.encode('utf-8'))
-                                except:
-                                    print("Failed to send response - client disconnected")
-                            except Exception as e:
-                                print(f"Error executing command: {str(e)}")
-                                traceback.print_exc()
-                                try:
-                                    error_response = {
-                                        "status": "error",
-                                        "message": str(e)
-                                    }
-                                    client.sendall(json.dumps(error_response).encode('utf-8'))
-                                except:
-                                    pass
-                            return None
-                        
-                        # Schedule execution in main thread
-                        bpy.app.timers.register(execute_wrapper, first_interval=0.0)
-                    except json.JSONDecodeError:
-                        # Incomplete data, wait for more
-                        pass
+                                client.sendall(json.dumps(response).encode('utf-8'))
+                            except:
+                                pass
+                            
+                            # Clear buffer and continue
+                            buffer = b''
+                            break
                 except Exception as e:
                     print(f"Error receiving data: {str(e)}")
                     break
-        except Exception as e:
-            print(f"Error in client handler: {str(e)}")
         finally:
             try:
                 client.close()
@@ -171,7 +381,7 @@ class BlenderMCPServer:
             print("Client handler stopped")
 
     def execute_command(self, command):
-        """Execute a command in the main Blender thread"""
+        """执行命令"""
         try:
             cmd_type = command.get("type")
             params = command.get("params", {})
@@ -191,7 +401,7 @@ class BlenderMCPServer:
             return {"status": "error", "message": str(e)}
 
     def _execute_command_internal(self, command):
-        """Internal command execution with proper context"""
+        """内部命令执行"""
         cmd_type = command.get("type")
         params = command.get("params", {})
 
@@ -247,7 +457,7 @@ class BlenderMCPServer:
 
     
     def get_simple_info(self):
-        """Get basic Blender information"""
+        """获取基本信息"""
         return {
             "blender_version": ".".join(str(v) for v in bpy.app.version),
             "scene_name": bpy.context.scene.name,
@@ -255,7 +465,7 @@ class BlenderMCPServer:
         }
     
     def get_scene_info(self):
-        """Get information about the current Blender scene"""
+        """获取场景信息"""
         try:
             print("Getting scene info...")
             # Simplify the scene info to reduce data size
@@ -311,7 +521,7 @@ class BlenderMCPServer:
     def create_object(self, type="CUBE", name=None, location=(0, 0, 0), rotation=(0, 0, 0), scale=(1, 1, 1),
                     align="WORLD", major_segments=48, minor_segments=12, mode="MAJOR_MINOR",
                     major_radius=1.0, minor_radius=0.25, abso_major_rad=1.25, abso_minor_rad=0.75, generate_uvs=True):
-        """Create a new object in the scene"""
+        """创建新对象"""
         try:
             # Deselect all objects first
             bpy.ops.object.select_all(action='DESELECT')
@@ -389,7 +599,7 @@ class BlenderMCPServer:
             return {"error": str(e)}
 
     def modify_object(self, name, location=None, rotation=None, scale=None, visible=None):
-        """Modify an existing object in the scene"""
+        """修改对象"""
         # Find the object by name
         obj = bpy.data.objects.get(name)
         if not obj:
@@ -425,7 +635,7 @@ class BlenderMCPServer:
         return result
 
     def delete_object(self, name):
-        """Delete an object from the scene"""
+        """删除对象"""
         obj = bpy.data.objects.get(name)
         if not obj:
             raise ValueError(f"Object not found: {name}")
@@ -440,7 +650,7 @@ class BlenderMCPServer:
         return {"deleted": obj_name}
     
     def get_object_info(self, name):
-        """Get detailed information about a specific object"""
+        """获取对象信息"""
         obj = bpy.data.objects.get(name)
         if not obj:
             raise ValueError(f"Object not found: {name}")
@@ -477,7 +687,7 @@ class BlenderMCPServer:
         return obj_info
     
     def execute_code(self, code):
-        """Execute arbitrary Blender Python code"""
+        """执行代码"""
         # This is powerful but potentially dangerous - use with caution
         try:
             # Create a local namespace for execution
@@ -488,7 +698,7 @@ class BlenderMCPServer:
             raise Exception(f"Code execution error: {str(e)}")
     
     def set_material(self, object_name, material_name=None, create_if_missing=True, color=None):
-        """Set or create a material for an object"""
+        """设置材质"""
         try:
             # Get the object
             obj = bpy.data.objects.get(object_name)
@@ -508,9 +718,13 @@ class BlenderMCPServer:
             else:
                 # Generate unique material name if none provided
                 mat_name = f"{object_name}_material"
-                mat = bpy.data.materials.get(mat_name)
-                if not mat:
-                    mat = bpy.data.materials.new(name=mat_name)
+                
+                # Remove any existing material with this name to avoid conflicts
+                existing_mat = bpy.data.materials.get(mat_name)
+                if existing_mat:
+                    bpy.data.materials.remove(existing_mat)
+                
+                mat = bpy.data.materials.new(name=mat_name)
                 material_name = mat_name
                 print(f"Using material: {mat_name}")
             
@@ -571,7 +785,7 @@ class BlenderMCPServer:
             }
     
     def render_scene(self, output_path=None, resolution_x=None, resolution_y=None):
-        """Render the current scene"""
+        """渲染场景"""
         if resolution_x is not None:
             bpy.context.scene.render.resolution_x = resolution_x
         
@@ -591,7 +805,7 @@ class BlenderMCPServer:
         }
 
     def get_polyhaven_categories(self, asset_type):
-        """Get categories for a specific asset type from Polyhaven"""
+        """获取 Polyhaven 类别"""
         try:
             if asset_type not in ["hdris", "textures", "models", "all"]:
                 return {"error": f"Invalid asset type: {asset_type}. Must be one of: hdris, textures, models, all"}
@@ -605,7 +819,7 @@ class BlenderMCPServer:
             return {"error": str(e)}
     
     def search_polyhaven_assets(self, asset_type=None, categories=None):
-        """Search for assets from Polyhaven with optional filtering"""
+        """搜索 Polyhaven 资产"""
         try:
             url = "https://api.polyhaven.com/assets"
             params = {}
@@ -961,7 +1175,7 @@ class BlenderMCPServer:
             return {"error": f"Failed to download asset: {str(e)}"}
 
     def set_texture(self, object_name, texture_id):
-        """Apply a previously downloaded Polyhaven texture to an object by creating a new material"""
+        """应用纹理"""
         try:
             # Get the object
             obj = bpy.data.objects.get(object_name)
@@ -1265,7 +1479,7 @@ class BlenderMCPServer:
             return {"error": f"Failed to apply texture: {str(e)}"}
 
     def get_polyhaven_status(self):
-        """Get the current status of PolyHaven integration"""
+        """获取 PolyHaven 状态"""
         enabled = bpy.context.scene.blendermcp_use_polyhaven
         if enabled:
             return {"enabled": True, "message": "PolyHaven integration is enabled and ready to use."}
@@ -1280,7 +1494,7 @@ class BlenderMCPServer:
 
     #region Hyper3D
     def get_hyper3d_status(self):
-        """Get the current status of Hyper3D Rodin integration"""
+        """获取 Hyper3D 状态"""
         enabled = bpy.context.scene.blendermcp_use_hyper3d
         if enabled:
             if not bpy.context.scene.blendermcp_hyper3d_api_key:
@@ -1394,8 +1608,8 @@ class BlenderMCPServer:
                 "Authorization": f"Bearer {bpy.context.scene.blendermcp_hyper3d_api_key}",
             },
             json={
-                "subscription_key": subscription_key,
-            },
+                'subscription_key': subscription_key
+            }
         )
         data = response.json()
         return {
@@ -1608,6 +1822,12 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
         scene = context.scene
         
         layout.prop(scene, "blendermcp_port")
+        layout.prop(scene, "blendermcp_is_remote")
+        if scene.blendermcp_is_remote:
+            layout.prop(scene, "blendermcp_remote_host")
+            layout.prop(scene, "blendermcp_remote_port")
+            layout.prop(scene, "blendermcp_api_key")
+        
         layout.prop(scene, "blendermcp_use_polyhaven", text="Use assets from Poly Haven")
 
         layout.prop(scene, "blendermcp_use_hyper3d", text="Use Hyper3D Rodin 3D model generation")
@@ -1644,7 +1864,15 @@ class BLENDERMCP_OT_StartServer(bpy.types.Operator):
         
         # Create a new server instance
         if not hasattr(bpy.types, "blendermcp_server") or not bpy.types.blendermcp_server:
-            bpy.types.blendermcp_server = BlenderMCPServer(port=scene.blendermcp_port)
+            if scene.blendermcp_is_remote:
+                bpy.types.blendermcp_server = BlenderMCPServer(
+                    is_remote=True,
+                    remote_host=scene.blendermcp_remote_host,
+                    remote_port=scene.blendermcp_remote_port,
+                    api_key=scene.blendermcp_api_key
+                )
+            else:
+                bpy.types.blendermcp_server = BlenderMCPServer(port=scene.blendermcp_port)
         
         # Start the server
         bpy.types.blendermcp_server.start()
@@ -1678,6 +1906,32 @@ def register():
         default=9876,
         min=1024,
         max=65535
+    )
+    
+    bpy.types.Scene.blendermcp_is_remote = BoolProperty(
+        name="Remote Mode",
+        description="Enable remote mode",
+        default=False
+    )
+    
+    bpy.types.Scene.blendermcp_remote_host = StringProperty(
+        name="Remote Host",
+        description="Remote host for the BlenderMCP server",
+        default="localhost"
+    )
+    
+    bpy.types.Scene.blendermcp_remote_port = IntProperty(
+        name="Remote Port",
+        description="Remote port for the BlenderMCP server",
+        default=9876,
+        min=1024,
+        max=65535
+    )
+    
+    bpy.types.Scene.blendermcp_api_key = StringProperty(
+        name="API Key",
+        description="API key for the BlenderMCP server",
+        default=""
     )
     
     bpy.types.Scene.blendermcp_server_running = bpy.props.BoolProperty(
@@ -1733,6 +1987,10 @@ def unregister():
     bpy.utils.unregister_class(BLENDERMCP_OT_StopServer)
     
     del bpy.types.Scene.blendermcp_port
+    del bpy.types.Scene.blendermcp_is_remote
+    del bpy.types.Scene.blendermcp_remote_host
+    del bpy.types.Scene.blendermcp_remote_port
+    del bpy.types.Scene.blendermcp_api_key
     del bpy.types.Scene.blendermcp_server_running
     del bpy.types.Scene.blendermcp_use_polyhaven
     del bpy.types.Scene.blendermcp_use_hyper3d

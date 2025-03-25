@@ -4,24 +4,70 @@ import socket
 import json
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Any, List
+from typing import AsyncIterator, Dict, Any, List, Optional
 import os
 from pathlib import Path
 import base64
 from urllib.parse import urlparse
+import time
+import uuid
+import ssl
+import secrets
+import argparse
+import threading
+import tempfile
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("BlenderMCPServer")
 
+# 默认 API 密钥长度
+API_KEY_LENGTH = 32
+# API 密钥验证映射，在生产环境中应该使用数据库存储
+API_KEY_TO_USER_ID = {}
+
+@dataclass
+class UserSession:
+    """用户会话数据类，存储用户的连接信息和实例"""
+    user_id: str
+    api_key: str
+    blender_connections: Dict[str, 'BlenderConnection'] = field(default_factory=dict)
+    last_activity: float = field(default_factory=time.time)
+    
+    def update_activity(self):
+        """更新最后活动时间"""
+        self.last_activity = time.time()
+
+# 存储用户会话
+user_sessions: Dict[str, UserSession] = {}
+
+def validate_api_key(api_key: str) -> Optional[str]:
+    """验证 API 密钥并返回用户 ID"""
+    # 在生产环境中，应该查询数据库验证 API 密钥
+    return API_KEY_TO_USER_ID.get(api_key)
+
+def get_user_session(user_id: str, api_key: str) -> UserSession:
+    """获取或创建用户会话"""
+    if user_id not in user_sessions:
+        user_sessions[user_id] = UserSession(user_id=user_id, api_key=api_key)
+    return user_sessions[user_id]
+
+def generate_api_key() -> str:
+    """生成一个随机的 API 密钥"""
+    return secrets.token_hex(API_KEY_LENGTH // 2)  # 每个字节生成两个十六进制字符
+
 @dataclass
 class BlenderConnection:
     host: str
     port: int
+    user_id: str = None  # 添加用户 ID
+    instance_id: str = None  # 添加实例 ID
+    instance_name: str = None  # 添加实例名称
     sock: socket.socket = None  # Changed from 'socket' to 'sock' to avoid naming conflict
+    is_remote: bool = False  # 标识是本地还是远程连接
     
     def connect(self) -> bool:
         """Connect to the Blender addon socket server"""
@@ -30,7 +76,48 @@ class BlenderConnection:
             
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            
+            # 如果是远程连接，使用 SSL 包装 socket
+            if self.is_remote:
+                try:
+                    context = ssl.create_default_context()
+                    self.sock = context.wrap_socket(self.sock, server_hostname=self.host)
+                    logger.info(f"Using SSL for connection to {self.host}:{self.port}")
+                except Exception as e:
+                    logger.error(f"Failed to setup SSL: {str(e)}")
+                    # 如果 SSL 失败，回退到非加密连接
+                    self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            
             self.sock.connect((self.host, self.port))
+            
+            # 如果有用户 ID 和实例 ID，发送认证信息
+            if self.is_remote and self.user_id and self.instance_id:
+                auth_data = {
+                    "user_id": self.user_id,
+                    "instance_id": self.instance_id,
+                    "instance_name": self.instance_name or f"Blender-{self.instance_id[:8]}"
+                }
+                auth_command = {
+                    "type": "authenticate",
+                    "params": auth_data
+                }
+                self.sock.sendall(json.dumps(auth_command).encode('utf-8'))
+                
+                # 等待认证响应
+                try:
+                    auth_response_data = self.receive_full_response(self.sock)
+                    auth_response = json.loads(auth_response_data.decode('utf-8'))
+                    
+                    if auth_response.get("status") != "success":
+                        logger.error(f"Authentication failed: {auth_response.get('message')}")
+                        self.sock = None
+                        return False
+                    logger.info(f"Authentication successful for user {self.user_id}, instance {self.instance_id}")
+                except Exception as e:
+                    logger.error(f"Error during authentication: {str(e)}")
+                    self.sock = None
+                    return False
+            
             logger.info(f"Connected to Blender at {self.host}:{self.port}")
             return True
         except Exception as e:
@@ -113,6 +200,11 @@ class BlenderConnection:
             "type": command_type,
             "params": params or {}
         }
+        
+        # 如果有用户 ID 和实例 ID，添加到命令中
+        if self.user_id and self.instance_id:
+            command["user_id"] = self.user_id
+            command["instance_id"] = self.instance_id
         
         try:
             # Log the command being sent
@@ -202,10 +294,62 @@ mcp = FastMCP(
 _blender_connection = None
 _polyhaven_enabled = False  # Add this global variable
 
-def get_blender_connection():
-    """Get or create a persistent Blender connection"""
+def get_blender_connection(user_id=None, instance_id=None, is_remote=False, remote_host=None, remote_port=None):
+    """Get or create a persistent Blender connection
+    
+    如果提供了 user_id 和 instance_id，则尝试返回指定用户和实例的连接。
+    如果是远程连接，则需要提供 remote_host 和 remote_port。
+    如果不提供任何参数，则返回默认的本地连接。
+    """
     global _blender_connection, _polyhaven_enabled  # Add _polyhaven_enabled to globals
     
+    # 如果指定了用户 ID 和实例 ID，尝试从用户会话中获取连接
+    if user_id and instance_id:
+        if user_id in user_sessions:
+            session = user_sessions[user_id]
+            session.update_activity()
+            
+            # 如果实例连接存在，检查是否有效
+            if instance_id in session.blender_connections:
+                connection = session.blender_connections[instance_id]
+                try:
+                    # 发送一个简单的命令检查连接是否有效
+                    if is_remote:
+                        # 对于远程连接，我们只检查 socket 是否存在
+                        if connection.sock:
+                            return connection
+                    else:
+                        # 对于本地连接，我们尝试发送命令
+                        result = connection.send_command("get_polyhaven_status")
+                        _polyhaven_enabled = result.get("enabled", False)
+                        return connection
+                except Exception as e:
+                    logger.warning(f"Connection for user {user_id}, instance {instance_id} is no longer valid: {str(e)}")
+                    try:
+                        connection.disconnect()
+                    except:
+                        pass
+                    # 移除无效连接
+                    session.blender_connections.pop(instance_id, None)
+            
+            # 如果到这里，说明需要创建新连接
+            if is_remote and remote_host and remote_port:
+                connection = BlenderConnection(
+                    host=remote_host,
+                    port=remote_port,
+                    user_id=user_id,
+                    instance_id=instance_id,
+                    is_remote=True
+                )
+                if connection.connect():
+                    session.blender_connections[instance_id] = connection
+                    logger.info(f"Created new remote connection for user {user_id}, instance {instance_id}")
+                    return connection
+                else:
+                    logger.error(f"Failed to create remote connection for user {user_id}, instance {instance_id}")
+                    raise Exception("Could not connect to remote Blender instance")
+    
+    # 下面是处理默认本地连接的原有逻辑
     # If we have an existing connection, check if it's still valid
     if _blender_connection is not None:
         try:
@@ -233,7 +377,6 @@ def get_blender_connection():
         logger.info("Created new persistent connection to Blender")
     
     return _blender_connection
-
 
 @mcp.tool()
 def get_scene_info(ctx: Context) -> str:
@@ -266,8 +409,6 @@ def get_object_info(ctx: Context, object_name: str) -> str:
         logger.error(f"Error getting object info from Blender: {str(e)}")
         return f"Error getting object info: {str(e)}"
 
-
-
 @mcp.tool()
 def create_object(
     ctx: Context,
@@ -295,9 +436,8 @@ def create_object(
     - name: Optional name for the object
     - location: Optional [x, y, z] location coordinates
     - rotation: Optional [x, y, z] rotation in radians
-    - scale: Optional [x, y, z] scale factors (not used for TORUS)
-    
-    Torus-specific parameters (only used when type == "TORUS"):
+    - scale: Optional [x, y, z] scale factors
+    - Torus-specific parameters (only used when type == "TORUS"):
     - align: How to align the torus ('WORLD', 'VIEW', or 'CURSOR')
     - major_segments: Number of segments for the main ring
     - minor_segments: Number of segments for the cross-section
@@ -352,7 +492,6 @@ def create_object(
     except Exception as e:
         logger.error(f"Error creating object: {str(e)}")
         return f"Error creating object: {str(e)}"
-
 
 @mcp.tool()
 def modify_object(
@@ -921,11 +1060,278 @@ def asset_creation_strategy() -> str:
     - The task specifically requires a basic material/color
     """
 
+# 用户管理和实例注册的工具函数
+
+@mcp.tool()
+def create_user(ctx: Context, username: str) -> str:
+    """
+    创建一个新用户并生成 API 密钥
+    
+    Parameters:
+    - username: 用户名，用于标识用户
+    
+    Returns:
+    包含用户 ID 和 API 密钥的 JSON 字符串
+    """
+    try:
+        # 生成用户 ID 和 API 密钥
+        user_id = str(uuid.uuid4())
+        api_key = generate_api_key()
+        
+        # 将 API 密钥与用户 ID 关联
+        API_KEY_TO_USER_ID[api_key] = user_id
+        
+        # 创建用户会话
+        get_user_session(user_id, api_key)
+        
+        # 返回用户信息
+        user_info = {
+            "user_id": user_id,
+            "username": username,
+            "api_key": api_key
+        }
+        logger.info(f"Created new user: {username} (ID: {user_id})")
+        
+        return json.dumps(user_info)
+    except Exception as e:
+        logger.error(f"Error creating user: {str(e)}")
+        return f"Error creating user: {str(e)}"
+
+@mcp.tool()
+def register_blender_instance(ctx: Context, api_key: str, instance_name: str = None) -> str:
+    """
+    注册一个新的 Blender 实例
+    
+    Parameters:
+    - api_key: 用户的 API 密钥
+    - instance_name: 可选的实例名称
+    
+    Returns:
+    包含实例 ID 和连接信息的 JSON 字符串
+    """
+    try:
+        # 验证 API 密钥
+        user_id = validate_api_key(api_key)
+        if not user_id:
+            raise Exception("无效的 API 密钥")
+        
+        # 生成实例 ID
+        instance_id = str(uuid.uuid4())
+        
+        # 设置实例名称
+        if not instance_name:
+            instance_name = f"Blender-{instance_id[:8]}"
+        
+        # 获取用户会话并添加实例信息
+        session = get_user_session(user_id, api_key)
+        
+        # 创建实例信息字典（尚未连接）
+        instance_info = {
+            "instance_id": instance_id,
+            "instance_name": instance_name,
+            "user_id": user_id,
+            "registered_at": time.time()
+        }
+        
+        # 返回实例信息
+        logger.info(f"Registered new Blender instance for user {user_id}: {instance_name} (ID: {instance_id})")
+        
+        return json.dumps(instance_info)
+    except Exception as e:
+        logger.error(f"Error registering Blender instance: {str(e)}")
+        return f"Error registering Blender instance: {str(e)}"
+
+@mcp.tool()
+def list_blender_instances(ctx: Context, api_key: str) -> str:
+    """
+    列出用户的所有 Blender 实例
+    
+    Parameters:
+    - api_key: 用户的 API 密钥
+    
+    Returns:
+    包含实例列表的 JSON 字符串
+    """
+    try:
+        # 验证 API 密钥
+        user_id = validate_api_key(api_key)
+        if not user_id:
+            raise Exception("无效的 API 密钥")
+        
+        # 获取用户会话
+        if user_id not in user_sessions:
+            return json.dumps({"instances": []})
+        
+        session = user_sessions[user_id]
+        
+        # 收集所有实例信息
+        instances = []
+        for instance_id, connection in session.blender_connections.items():
+            instances.append({
+                "instance_id": instance_id,
+                "instance_name": connection.instance_name or f"Blender-{instance_id[:8]}",
+                "connected": connection.sock is not None,
+                "host": connection.host,
+                "port": connection.port
+            })
+        
+        return json.dumps({"instances": instances})
+    except Exception as e:
+        logger.error(f"Error listing Blender instances: {str(e)}")
+        return f"Error listing Blender instances: {str(e)}"
+
+@mcp.tool()
+def route_command(ctx: Context, api_key: str, target_instance_id: str, command_type: str, params: Dict[str, Any] = None) -> str:
+    """
+    将命令路由到指定的 Blender 实例
+    
+    Parameters:
+    - api_key: 用户的 API 密钥
+    - target_instance_id: 目标 Blender 实例的 ID
+    - command_type: 要发送的命令类型
+    - params: 命令参数
+    
+    Returns:
+    目标实例返回的结果
+    """
+    try:
+        # 验证 API 密钥
+        user_id = validate_api_key(api_key)
+        if not user_id:
+            raise Exception("无效的 API 密钥")
+        
+        # 获取用户会话
+        if user_id not in user_sessions:
+            raise Exception("用户会话不存在")
+        
+        session = user_sessions[user_id]
+        
+        # 检查目标实例是否存在
+        if target_instance_id not in session.blender_connections:
+            raise Exception(f"目标 Blender 实例 {target_instance_id} 不存在或不属于当前用户")
+        
+        # 获取目标连接并发送命令
+        target_connection = session.blender_connections[target_instance_id]
+        result = target_connection.send_command(command_type, params)
+        
+        return json.dumps(result)
+    except Exception as e:
+        logger.error(f"Error routing command: {str(e)}")
+        return f"Error routing command: {str(e)}"
+
 # Main execution
 
 def main():
-    """Run the MCP server"""
-    mcp.run()
+    """Run the Blender MCP server"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Blender MCP Server')
+    parser.add_argument('--host', default='localhost', help='Host to listen on')
+    parser.add_argument('--port', type=int, default=5000, help='Port to listen on')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    parser.add_argument('--allow-remote', action='store_true', help='Allow remote connections')
+    parser.add_argument('--ssl-cert', help='Path to SSL certificate file')
+    parser.add_argument('--ssl-key', help='Path to SSL key file')
+    parser.add_argument('--admin-key', help='API key for admin access')
+    
+    args = parser.parse_args()
+    
+    # 设置全局配置
+    global ALLOW_REMOTE_CONNECTIONS, ADMIN_API_KEY
+    ALLOW_REMOTE_CONNECTIONS = args.allow_remote
+    ADMIN_API_KEY = args.admin_key or secrets.token_hex(16)
+    
+    # 设置会话清理计时器
+    session_cleanup_thread = threading.Thread(target=_session_cleanup_loop)
+    session_cleanup_thread.daemon = True
+    session_cleanup_thread.start()
+    
+    if args.allow_remote:
+        logger.info(f"Server will accept remote connections on {args.host}:{args.port}")
+        logger.info(f"Admin API Key: {ADMIN_API_KEY}")
+        
+        # 如果没有提供 SSL 证书和密钥，但允许远程连接，生成自签名证书
+        if not args.ssl_cert or not args.ssl_key:
+            logger.warning("No SSL certificate provided for remote connections. Generating self-signed certificate...")
+            
+            # 在生产环境中，应该使用适当的证书
+            cert_file = os.path.join(tempfile.gettempdir(), "blender_mcp_cert.pem")
+            key_file = os.path.join(tempfile.gettempdir(), "blender_mcp_key.pem")
+            
+            # 这里应该有生成自签名证书的代码
+            # 例如使用 OpenSSL 或 Python 的 cryptography 库
+            
+            args.ssl_cert = cert_file
+            args.ssl_key = key_file
+    else:
+        if args.host != 'localhost' and args.host != '127.0.0.1':
+            logger.warning("Remote connections are not allowed, forcing host to localhost")
+            args.host = 'localhost'
+    
+    # 创建管理员会话
+    admin_user_id = "admin"
+    API_KEY_TO_USER_ID[ADMIN_API_KEY] = admin_user_id
+    admin_session = UserSession(user_id=admin_user_id, api_key=ADMIN_API_KEY)
+    user_sessions[admin_user_id] = admin_session
+    
+    # 配置 SSL 上下文（如果启用了 SSL）
+    ssl_context = None
+    if args.ssl_cert and args.ssl_key:
+        try:
+            import ssl
+            ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            ssl_context.load_cert_chain(args.ssl_cert, args.ssl_key)
+            logger.info("SSL enabled for server")
+        except Exception as e:
+            logger.error(f"Failed to setup SSL: {str(e)}")
+            if args.allow_remote:
+                logger.error("Remote connections are allowed but SSL failed to initialize. This is insecure!")
+    
+    # 启动服务器
+    mcp_server = mcp.server.fastmcp.FastMCPServer(
+        app_dir=os.path.dirname(__file__),
+        host=args.host,
+        port=args.port,
+        debug=args.debug,
+        ssl_context=ssl_context
+    )
+    
+    logger.info(f"Starting Blender MCP server on {args.host}:{args.port}")
+    mcp_server.serve()
+
+# 会话清理循环
+def _session_cleanup_loop():
+    """周期性清理不活跃的会话"""
+    while True:
+        try:
+            cleanup_inactive_sessions()
+        except Exception as e:
+            logger.error(f"Error cleaning up sessions: {str(e)}")
+        
+        # 每 5 分钟检查一次
+        time.sleep(5 * 60)
+
+# 用户会话清理计时器
+def cleanup_inactive_sessions():
+    """清理不活跃的用户会话"""
+    current_time = time.time()
+    sessions_to_remove = []
+    
+    for user_id, session in user_sessions.items():
+        # 如果会话超过 30 分钟不活跃，则清理
+        if current_time - session.last_activity > 30 * 60:
+            logger.info(f"Cleaning up inactive session for user {user_id}")
+            # 断开所有连接
+            for instance_id, conn in session.blender_connections.items():
+                try:
+                    conn.disconnect()
+                except:
+                    pass
+            sessions_to_remove.append(user_id)
+    
+    # 从字典中移除会话
+    for user_id in sessions_to_remove:
+        user_sessions.pop(user_id, None)
 
 if __name__ == "__main__":
     main()
